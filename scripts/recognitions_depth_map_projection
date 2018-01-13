@@ -1,0 +1,206 @@
+#!/usr/bin/env python
+from functools import partial
+
+import image_geometry
+import message_filters
+import rospy
+import tf2_ros
+from tf2_geometry_msgs import PointStamped
+from cv_bridge import CvBridge
+from geometry_msgs.msg import Point
+from sensor_msgs.msg import Image, CameraInfo
+from image_recognition_msgs.msg import Recognitions
+from image_recognition_util.image_writer import color_map
+import numpy as np
+from visualization_msgs.msg import MarkerArray, Marker
+from wire_msgs.msg import WorldEvidence
+
+
+def get_param(name, default):
+    """
+    Get parameter with default value, if parameter is not found, a warning will be printed
+    :param name: param_name
+    :param default: default value
+    :return: parameter
+    """
+    if rospy.has_param(name):
+        return rospy.get_param(name)
+    else:
+        rospy.logwarn('parameter %s not set, using the default value of %s', name, default)
+        return rospy.get_param(name, default)
+
+
+class RecognitionsDepthMapProjection(object):
+
+    def __init__(self):
+        self._bridge = CvBridge()
+
+        self._margin_x = int(get_param("~margin_x", 0))
+        self._margin_y = int(get_param("~margin_y", 0))
+        self._robot_frame = get_param("~robot_frame", "base_link")
+        self._object_height = float(get_param("~object_height", 2.0))
+        self._probability_threshold = float(get_param("~probability_threshold", 0))
+
+        # Make sure we have the required camera info's on forehand
+        self._camera_model, self._scale_factor = self._get_camera_model_and_scale_factor()
+
+        # Register synchronized callback
+        depth_sub = message_filters.Subscriber('camera/depth/image', Image, queue_size=1)
+        recognitions_sub = message_filters.Subscriber('camera/rgb/recognitions', Recognitions, queue_size=1)
+        self._ts = message_filters.ApproximateTimeSynchronizer([depth_sub, recognitions_sub],
+                                                               queue_size=10, slop=.1)
+        self._ts.registerCallback(self.callback)
+
+        # TF for transforming to common robot_frame
+        self._tf_buffer = tf2_ros.Buffer()
+        self._tf_listener = tf2_ros.TransformListener(self._tf_buffer)
+
+        # Output topics
+        self._recognitions_depth_publisher = rospy.Publisher("camera/recognitions_depth/image", Image, queue_size=1)
+        self._markers_publisher = rospy.Publisher('camera/recognitions_visualization', MarkerArray, queue_size=1)
+        self._evidence_publisher = rospy.Publisher('camera/recognitions_world_evidence', WorldEvidence, queue_size=1)
+
+    @staticmethod
+    def _get_camera_model_and_scale_factor():
+        """
+        Method that waits for the camera info of the rgb camera (used in the recognitions) and the depth cam info
+        required for projection
+        """
+
+        camera_info = {"rgb": None, "depth": None}
+
+        def set_camera_info(key, msg):
+            camera_info[key] = msg
+
+        rgb_camera_info_sub = rospy.Subscriber("camera/rgb/camera_info", CameraInfo, partial(set_camera_info, "rgb"))
+        depth_camera_info_sub = rospy.Subscriber("camera/depth/camera_info", CameraInfo, partial(set_camera_info, "depth"))
+
+        while not rospy.is_shutdown() and None in camera_info.values():
+            rospy.loginfo_throttle(1.0, "Waiting for rgb and depth camera info ...")
+            rospy.Rate(.1)
+
+        rospy.loginfo("Depth and RGB camera info received")
+        rgb_camera_info_sub.unregister()
+        depth_camera_info_sub.unregister()
+
+        model = image_geometry.PinholeCameraModel()
+        model.fromCameraInfo(camera_info["depth"])
+
+        width_scale_factor = float(model.width) / camera_info["rgb"].width
+        height_scale_factor = float(model.height) / camera_info["rgb"].height
+        scale_factor = min(width_scale_factor, height_scale_factor)
+
+        if scale_factor != 1.0:
+            rospy.logwarn("The size of the RGB image != Depth image, recognitions    scale factor %.2f", scale_factor)
+
+        return model, scale_factor
+
+    @staticmethod
+    def _get_updated_roi(roi, margin_x, margin_y, scale_factor, width, height):
+        def clip(i, i_max):
+            return min(max(0, int(i)), i_max)
+
+        x_min = clip((roi.x_offset - margin_x) * scale_factor, width - 1)
+        x_max = clip((roi.x_offset + roi.width + margin_x) * scale_factor, width - 1)
+        y_min = clip((roi.y_offset - margin_y) * scale_factor, height - 1)
+        y_max = clip((roi.y_offset + roi.height + margin_y) * scale_factor, height - 1)
+
+        # Check if min is min and max is max
+        if x_min >= x_max or y_min >= y_max:
+            raise ValueError("Invalid region of interest result")
+
+        return x_min, y_min, x_max, y_max
+
+    @staticmethod
+    def _visualization_marker_from_point_and_label(point_stamped, label, idx, color, obj_height):
+        m = Marker()
+        m.header = point_stamped.header
+        m.id = idx
+        m.pose.position = point_stamped.point
+        m.pose.orientation.w = 1
+        m.type = Marker.CYLINDER
+        m.scale.x = m.scale.y = 0.45
+        m.scale.z = obj_height
+        m.color.r = color[0]
+        m.color.g = color[1]
+        m.color.b = color[2]
+        m.color.a = 1.0
+        m.lifetime = rospy.Duration(0.1)
+        return m
+
+    def callback(self, depth_msg, recognitions_msg):
+        rospy.loginfo("Callback received")
+
+        marker_array_msg = MarkerArray()
+
+        # Copy required to replace 0 with nan
+        depth = np.copy(self._bridge.imgmsg_to_cv2(depth_msg))
+        depth[depth == 0] = np.nan
+
+        height, width = depth.shape[:2]
+
+        recognitions_depth = np.zeros_like(depth)
+
+        # Loop over all recognitions
+        cmap = color = color_map(len(recognitions_msg.recognitions), normalized=True)
+        for i, r in enumerate(recognitions_msg.recognitions):
+            assert len(r.categorical_distribution.probabilities) == 1
+            pl = r.categorical_distribution.probabilities[0]
+            label = pl.label
+            p = pl.probability
+
+            if p < self._probability_threshold:
+                rospy.logdebug("Skipping %s because %.2f < threshold (%.2f)", label, p, self._probability_threshold)
+                continue
+
+            try:
+                x_min, y_min, x_max, y_max = self._get_updated_roi(r.roi, self._margin_x, self._margin_y,
+                                                                   self._scale_factor, width, height)
+            except ValueError as e:
+                rospy.logwarn(e.message)
+                continue
+
+            region = depth[y_min:y_max, x_min:x_max]
+
+            # debugging viz
+            recognitions_depth[y_min:y_max, x_min:x_max] = depth[y_min:y_max, x_min:x_max]
+            recognitions_depth_msg = self._bridge.cv2_to_imgmsg(recognitions_depth)
+            recognitions_depth_msg.header = depth_msg.header
+            self._recognitions_depth_publisher.publish(recognitions_depth_msg)
+
+            u = (x_min + x_max) // 2
+            v = (y_min + y_max) // 2
+
+            # skip fully nan
+            if np.all(np.isnan(region)):
+                continue
+
+            median = np.nanmedian(region)
+            rospy.logdebug('region p=%f min=%f, max=%f, median=%f', p, np.nanmin(region), np.nanmax(region), median)
+
+            # project to 3d
+            d = median
+            ray = np.array(self._camera_model.projectPixelTo3dRay((u, v)))
+            point3d = ray * d
+            rospy.logdebug('3d point of %s is %d,%d: %s', label, u, v, point3d)
+
+            # Convert to stamped point in order to transform using tf
+            point_stamped = PointStamped(header=depth_msg.header, point=Point(x=point3d[0], y=point3d[1], z=point3d[2]))
+
+            try:
+                robot_frame_point_stamped = self._tf_buffer.transform(point_stamped, self._robot_frame)
+            except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException):
+                rospy.logerr("Unable to transform point to robot_frame")
+                continue
+            else:
+                robot_frame_point_stamped.point.z = self._object_height / 2
+                marker_array_msg.markers.append(self._visualization_marker_from_point_and_label(
+                    robot_frame_point_stamped, label, i, cmap[i], self._object_height))
+
+        self._markers_publisher.publish(marker_array_msg)
+
+
+if __name__ == '__main__':
+    rospy.init_node('recognitions_depth_map_projection')
+    RecognitionsDepthMapProjection()
+    rospy.spin()
