@@ -1,0 +1,15 @@
+<launch>
+  <group ns="camera">
+    <node pkg="image_recognition_wire" type="recognitions_depth_map_projection" name="recognitions_depth_map_projection" output="screen">
+      <remap from="depth/image" to="depth_registered/sw_registered/image_rect" />
+      <remap from="depth/camera_info" to="depth_registered/sw_registered/camera_info" />
+    </node>
+
+    <node pkg="tf2_ros" type="static_transform_publisher" name="camera_static_transform_publisher"
+    args="0 0 1.5 0 0 0 base_link camera_link" />
+  </group>
+
+  <node pkg="wire_viz" type="visualization" respawn="false" name="visualization" output="screen">
+    <rosparam file="$(find image_recognition_wire)/parameters/wire_viz.yaml" command="load" />
+  </node>
+</launch>
